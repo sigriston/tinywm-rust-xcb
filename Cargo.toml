@@ -1,0 +1,8 @@
+[package]
+name = "tinywm-rust-xcb"
+version = "0.1.0"
+authors = ["Thiago Sigrist <sigrist@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+xcb = "0.8"
