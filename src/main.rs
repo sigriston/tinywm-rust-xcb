@@ -1,33 +1,42 @@
 use xcb;
 use std::cmp::max;
 
-struct ButtonPress {
-    id: xcb::Window,
+/// Tracks the start of a mouse drag
+struct DragStart {
+    /// x coordinate of button press that started the drag
     root_x: i16,
+    /// y coordinate of button press that started the drag
     root_y: i16,
+    /// child window that's the target of the drag
+    child: xcb::Window,
+    /// geometry of child window
+    child_geom: WindowGeom,
 }
 
-impl ButtonPress {
-    fn from_event(event: xcb::GenericEvent) -> Option<Self> {
+impl DragStart {
+    /// Creates DragStart from a xcb event (must be a button press)
+    fn from_event(conn: &xcb::Connection, event: xcb::GenericEvent) -> Option<Self> {
         let button_press: &xcb::ButtonPressEvent = unsafe {
             xcb::cast_event(&event)
         };
-        let id = button_press.child();
+        let child = button_press.child();
 
-        if id == xcb::NONE {
+        // if button press is not on a window, we don't care
+        if child == xcb::NONE {
             None
         } else {
-            Some(ButtonPress {
-                id,
+            Some(Self {
                 root_x: button_press.root_x(),
                 root_y: button_press.root_y(),
+                child,
+                child_geom: WindowGeom::from_window_id(conn, child),
             })
         }
     }
 }
 
+/// Basic window geometry structure
 struct WindowGeom {
-    id: xcb::Window,
     x: i16,
     y: i16,
     width: u16,
@@ -35,11 +44,11 @@ struct WindowGeom {
 }
 
 impl WindowGeom {
+    /// Creates a WindowGeom structure given the window's id
     fn from_window_id(conn: &xcb::Connection, id: xcb::Window) -> Self {
         let cookie = xcb::get_geometry(&conn, id);
         let geom = cookie.get_reply().unwrap();
         WindowGeom {
-            id,
             x: geom.x(),
             y: geom.y(),
             width: geom.width(),
@@ -54,14 +63,13 @@ fn main() {
     // if it returns an error, unwrap will pick it up and panic, and the program will terminate.
     let (conn, default_screen_num) = xcb::Connection::connect(None).unwrap();
 
+    // obtain id of the root window; only works when there is a single screen, as we only get the
+    // root of the default screen
     let setup = conn.get_setup();
     let screen = setup.roots().nth(default_screen_num as usize).unwrap();
     let default_root_window = screen.root();
 
-    // TODO: Not possible now
-    // xcb::grab_key();
-
-    // grab Alt + Button1
+    // grab Alt + Button1 (moving windows)
     xcb::grab_button(
         &conn,
         true,
@@ -75,7 +83,7 @@ fn main() {
         xcb::MOD_MASK_1 as u16,
     );
 
-    // grab Alt + Button3
+    // grab Alt + Button3 (resizing windows)
     xcb::grab_button(
         &conn,
         true,
@@ -92,67 +100,70 @@ fn main() {
     // flush to ensure grab requests are honored
     conn.flush();
 
-    // STATE
-    let mut button_press: Option<ButtonPress> = None;
-    let mut start: Option<WindowGeom> = None;
+    // used to save info of when a mouse drag starts
+    let mut drag_start: Option<DragStart> = None;
 
     loop {
+        // synchronously get the next event, similar to XNextEvent() from Xlib
         let event = conn.wait_for_event();
         match event {
+            // None is returned in case of I/O error; we'll just bail in that case
             None => { break; }
             Some(event) => {
+                // the response type identifies the kind of event we're getting here, and it's a
+                // sequential u8; the most significant bit is supposed to be masked out
                 let r = event.response_type() & !0x80;
-                // println!("EVENT!");
                 match r {
                     xcb::BUTTON_PRESS => {
-                        let bpe = ButtonPress::from_event(event);
-
-                        // we only care about the button press if it initiated inside a child
-                        // window
-                        if bpe.is_some() {
-                            button_press = bpe;
-                            let button_press = button_press.as_ref().unwrap();
-
-                            start = Some(WindowGeom::from_window_id(
-                                &conn,
-                                button_press.id,
-                            ));
-                        }
+                        // in case of a button press we want to remember it as the start of a mouse
+                        // drag; this will be None in case we don't care (when it's not targeting a
+                        // client window)
+                        drag_start = DragStart::from_event(&conn, event);
                     }
                     xcb::MOTION_NOTIFY => {
                         let mne: &xcb::MotionNotifyEvent  = unsafe {
                             xcb::cast_event(&event)
                         };
 
-                        if let (&Some(ref button_press), &Some(ref window_geom)) = (&button_press, &start) {
+                        // only do anything if this is a true window drag
+                        if let Some(ref drag_start) = drag_start {
                             let root_x = mne.root_x();
                             let root_y = mne.root_y();
 
+                            // state is a flags field indicating which buttons are being held
                             let state = mne.state();
 
-                            let xdiff = root_x - button_press.root_x;
-                            let ydiff = root_y - button_press.root_y;
+                            // calculate how far we've dragged from the start
+                            let xdiff = root_x - drag_start.root_x;
+                            let ydiff = root_y - drag_start.root_y;
 
-                            let final_x = window_geom.x + match state & xcb::KEY_BUT_MASK_BUTTON_1 as u16 {
+                            // if Button1 is being held, we're moving the window, so modify its x/y
+                            let final_x = drag_start.child_geom.x + match state & xcb::KEY_BUT_MASK_BUTTON_1 as u16 {
                                 0 => 0,
                                 _ => xdiff,
                             };
-                            let final_y = window_geom.y + match state & xcb::KEY_BUT_MASK_BUTTON_1 as u16 {
+                            let final_y = drag_start.child_geom.y + match state & xcb::KEY_BUT_MASK_BUTTON_1 as u16 {
                                 0 => 0,
                                 _ => ydiff,
                             };
-                            let final_width = max(1i16, window_geom.width as i16 + match state & xcb::KEY_BUT_MASK_BUTTON_3 as u16 {
+
+                            // if Button3 is being held, we're resizing, in which case we'll modify
+                            // the window's width and height; the max function ensures that width
+                            // and height will be at least 1, preventing overflows or, worse, 0s
+                            // which are fatal
+                            let final_width = max(1i16, drag_start.child_geom.width as i16 + match state & xcb::KEY_BUT_MASK_BUTTON_3 as u16 {
                                 0 => 0,
                                 _ => xdiff,
                             });
-                            let final_height = max(1i16, window_geom.height as i16 + match state & xcb::KEY_BUT_MASK_BUTTON_3 as u16 {
+                            let final_height = max(1i16, drag_start.child_geom.height as i16 + match state & xcb::KEY_BUT_MASK_BUTTON_3 as u16 {
                                 0 => 0,
                                 _ => ydiff,
                             });
 
+                            // reconfigure the window with the computed position and dimensions
                             xcb::configure_window(
                                 &conn,
-                                window_geom.id,
+                                drag_start.child,
                                 &[
                                     (xcb::CONFIG_WINDOW_X as u16, final_x as u32),
                                     (xcb::CONFIG_WINDOW_Y as u16, final_y as u32),
@@ -160,12 +171,14 @@ fn main() {
                                     (xcb::CONFIG_WINDOW_HEIGHT as u16, final_height as u32),
                                 ],
                             );
+
+                            // we flush every time... might not be the best for perf but is easy
                             conn.flush();
                         }
                     }
                     xcb::BUTTON_RELEASE => {
-                        button_press = None;
-                        start = None;
+                        // when the mouse button is release we're no longer dragging
+                        drag_start = None;
                     }
                     _ => {}
                 }
